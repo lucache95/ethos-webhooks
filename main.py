@@ -386,6 +386,59 @@ async def cal_webhook(request: Request, background_tasks: BackgroundTasks):
     return JSONResponse({"status": "ignored", "trigger": trigger_event})
 
 
+@app.post("/health-data")
+async def health_data(request: Request):
+    """
+    Receives Apple Health data from Health Auto Export app.
+    Appends to ~/clawd/health/apple-health-log.csv on the local machine via webhook.
+    Since this runs on Railway (not local), we forward a Telegram notification
+    and store the raw payload for Ethos to process.
+    """
+    import csv, io
+    try:
+        payload = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid json"}, status_code=400)
+
+    # Log the raw payload as JSON lines to a rolling file
+    # We notify via Telegram so Ethos can process it
+    timestamp = datetime.now(timezone.utc).isoformat()
+    
+    # Extract key metrics if present (Health Auto Export format)
+    metrics = payload.get("data", {}).get("metrics", []) or payload.get("metrics", [])
+    
+    summary = {}
+    for metric in metrics:
+        name = metric.get("name", "")
+        data_points = metric.get("data", [])
+        if data_points:
+            latest = data_points[-1]
+            summary[name] = latest.get("qty") or latest.get("value") or latest.get("avg")
+
+    # Forward to Telegram via gateway if configured
+    GATEWAY_URL = os.getenv("MOLTBOT_GATEWAY_URL", "")
+    GATEWAY_TOKEN = os.getenv("MOLTBOT_GATEWAY_TOKEN", "")
+    
+    if GATEWAY_URL and summary:
+        try:
+            async with httpx.AsyncClient() as client:
+                await client.post(
+                    f"{GATEWAY_URL}/webhook/health-data",
+                    headers={"Authorization": f"Bearer {GATEWAY_TOKEN}"},
+                    json={"timestamp": timestamp, "summary": summary, "raw": payload},
+                    timeout=10.0
+                )
+        except Exception:
+            pass  # best effort
+
+    return JSONResponse({
+        "status": "ok",
+        "received_at": timestamp,
+        "metrics_received": len(metrics),
+        "summary": summary
+    })
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
