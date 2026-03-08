@@ -386,56 +386,135 @@ async def cal_webhook(request: Request, background_tasks: BackgroundTasks):
     return JSONResponse({"status": "ignored", "trigger": trigger_event})
 
 
+SUPABASE_URL = "https://tolxzrjwvjwhxhcggvhr.supabase.co"
+SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InRvbHh6cmp3dmp3aHhoY2dndmhyIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc2NTU3Nzg3NiwiZXhwIjoyMDgxMTUzODc2fQ.NGcq_Wwhjv71-6pqyxCAV_NbKDlquynCSX-DWvf2w4A"
+
+
+def _extract_metric_avg(metrics_by_name: dict, name: str):
+    """Average all qty values for a named metric."""
+    m = metrics_by_name.get(name)
+    if not m:
+        return None
+    pts = [p.get("qty") for p in m.get("data", []) if p.get("qty") is not None]
+    return round(sum(pts) / len(pts), 2) if pts else None
+
+
+def _extract_metric_latest(metrics_by_name: dict, name: str):
+    """Return the qty of the last data point for a named metric."""
+    m = metrics_by_name.get(name)
+    if not m:
+        return None
+    pts = [p.get("qty") for p in m.get("data", []) if p.get("qty") is not None]
+    return pts[-1] if pts else None
+
+
+def _extract_metric_sum(metrics_by_name: dict, name: str):
+    """Sum all qty values for a named metric."""
+    m = metrics_by_name.get(name)
+    if not m:
+        return None
+    pts = [p.get("qty") for p in m.get("data", []) if p.get("qty") is not None]
+    return round(sum(pts), 2) if pts else None
+
+
+def _extract_sleep_hours(metrics_by_name: dict):
+    """Sum 'asleep' values from sleep_analysis metric."""
+    m = metrics_by_name.get("sleep_analysis")
+    if not m:
+        return None
+    total = sum(
+        p.get("qty", 0) or 0
+        for p in m.get("data", [])
+        if str(p.get("value", "")).lower() in ("asleep", "inbed", "")
+        or p.get("qty") is not None
+    )
+    # If data points have a 'value' field filter to 'asleep' category
+    asleep_pts = [p for p in m.get("data", []) if str(p.get("value", "")).lower() == "asleep"]
+    if asleep_pts:
+        total = sum(p.get("qty", 0) or 0 for p in asleep_pts)
+    elif m.get("data"):
+        total = sum(p.get("qty", 0) or 0 for p in m.get("data", []) if p.get("qty") is not None)
+    else:
+        return None
+    return round(total, 2) if total else None
+
+
 @app.post("/health-data")
 async def health_data(request: Request):
     """
     Receives Apple Health data from Health Auto Export app.
-    Appends to ~/clawd/health/apple-health-log.csv on the local machine via webhook.
-    Since this runs on Railway (not local), we forward a Telegram notification
-    and store the raw payload for Ethos to process.
+    Parses metrics and stores persistently in Supabase apple_health_log table.
+    Local sync: run ~/clawd/health/sync-health-csv.py to pull to CSV.
     """
-    import csv, io
     try:
         payload = await request.json()
     except Exception:
         return JSONResponse({"error": "invalid json"}, status_code=400)
 
-    # Log the raw payload as JSON lines to a rolling file
-    # We notify via Telegram so Ethos can process it
     timestamp = datetime.now(timezone.utc).isoformat()
-    
-    # Extract key metrics if present (Health Auto Export format)
-    metrics = payload.get("data", {}).get("metrics", []) or payload.get("metrics", [])
-    
-    summary = {}
-    for metric in metrics:
-        name = metric.get("name", "")
-        data_points = metric.get("data", [])
-        if data_points:
-            latest = data_points[-1]
-            summary[name] = latest.get("qty") or latest.get("value") or latest.get("avg")
 
-    # Forward to Telegram via gateway if configured
-    GATEWAY_URL = os.getenv("MOLTBOT_GATEWAY_URL", "")
-    GATEWAY_TOKEN = os.getenv("MOLTBOT_GATEWAY_TOKEN", "")
-    
-    if GATEWAY_URL and summary:
-        try:
-            async with httpx.AsyncClient() as client:
-                await client.post(
-                    f"{GATEWAY_URL}/webhook/health-data",
-                    headers={"Authorization": f"Bearer {GATEWAY_TOKEN}"},
-                    json={"timestamp": timestamp, "summary": summary, "raw": payload},
-                    timeout=10.0
-                )
-        except Exception:
-            pass  # best effort
+    # Extract metrics list (Health Auto Export format)
+    metrics = payload.get("data", {}).get("metrics", []) or payload.get("metrics", [])
+
+    # Build lookup dict by metric name
+    metrics_by_name = {m.get("name", ""): m for m in metrics if m.get("name")}
+
+    # Extract each metric
+    heart_rate_avg = _extract_metric_avg(metrics_by_name, "heart_rate")
+    heart_rate_resting = _extract_metric_latest(metrics_by_name, "resting_heart_rate")
+    hrv_ms = _extract_metric_latest(metrics_by_name, "heart_rate_variability")
+    steps_raw = _extract_metric_sum(metrics_by_name, "step_count")
+    steps = int(steps_raw) if steps_raw is not None else None
+    active_calories = _extract_metric_sum(metrics_by_name, "active_energy_burned")
+    sleep_hours = _extract_sleep_hours(metrics_by_name)
+    respiratory_rate = _extract_metric_avg(metrics_by_name, "respiratory_rate")
+    blood_oxygen_pct = _extract_metric_avg(metrics_by_name, "oxygen_saturation")
+
+    # Insert into Supabase
+    insert_data = {
+        "source": "apple_health_auto_export",
+        "heart_rate_avg": heart_rate_avg,
+        "heart_rate_resting": heart_rate_resting,
+        "hrv_ms": hrv_ms,
+        "steps": steps,
+        "active_calories": active_calories,
+        "sleep_hours": sleep_hours,
+        "respiratory_rate": respiratory_rate,
+        "blood_oxygen_pct": blood_oxygen_pct,
+        "raw_metrics_count": len(metrics),
+        "raw_payload": payload,
+    }
+    # Remove None values so Supabase uses column defaults
+    insert_data = {k: v for k, v in insert_data.items() if v is not None}
+
+    stored = False
+    store_error = None
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                f"{SUPABASE_URL}/rest/v1/apple_health_log",
+                headers={
+                    "apikey": SUPABASE_KEY,
+                    "Authorization": f"Bearer {SUPABASE_KEY}",
+                    "Content-Type": "application/json",
+                    "Prefer": "return=minimal",
+                },
+                json=insert_data,
+                timeout=10.0,
+            )
+            if resp.status_code in (200, 201):
+                stored = True
+            else:
+                store_error = f"HTTP {resp.status_code}: {resp.text[:200]}"
+    except Exception as e:
+        store_error = str(e)
 
     return JSONResponse({
         "status": "ok",
-        "received_at": timestamp,
+        "stored": stored,
         "metrics_received": len(metrics),
-        "summary": summary
+        "received_at": timestamp,
+        **({"error": store_error} if store_error else {}),
     })
 
 
