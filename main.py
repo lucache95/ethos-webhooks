@@ -390,60 +390,145 @@ SUPABASE_URL = "https://tolxzrjwvjwhxhcggvhr.supabase.co"
 SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InRvbHh6cmp3dmp3aHhoY2dndmhyIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc2NTU3Nzg3NiwiZXhwIjoyMDgxMTUzODc2fQ.NGcq_Wwhjv71-6pqyxCAV_NbKDlquynCSX-DWvf2w4A"
 
 
-def _extract_metric_avg(metrics_by_name: dict, name: str):
-    """Average all qty values for a named metric."""
-    m = metrics_by_name.get(name)
-    if not m:
-        return None
-    pts = [p.get("qty") for p in m.get("data", []) if p.get("qty") is not None]
-    return round(sum(pts) / len(pts), 2) if pts else None
+def parse_metrics(metrics: list) -> dict:
+    """
+    Parse all Apple Health Auto Export metrics into a flat dict for DB storage.
+    Handles 23 metric types with appropriate aggregation strategies.
+    """
+    result = {}
 
+    for m in metrics:
+        name = m.get('name', '')
+        data = m.get('data', [])
+        if not data:
+            continue
 
-def _extract_metric_latest(metrics_by_name: dict, name: str):
-    """Return the qty of the last data point for a named metric."""
-    m = metrics_by_name.get(name)
-    if not m:
-        return None
-    pts = [p.get("qty") for p in m.get("data", []) if p.get("qty") is not None]
-    return pts[-1] if pts else None
+        if name == 'sleep_analysis':
+            s = data[0]
+            result['sleep_total_hours'] = s.get('totalSleep')
+            result['sleep_rem_hours'] = s.get('rem')
+            result['sleep_deep_hours'] = s.get('deep')
+            result['sleep_core_hours'] = s.get('core')
+            result['sleep_awake_hours'] = s.get('awake')
+            result['sleep_in_bed_hours'] = s.get('inBed')
+            # Parse sleep window timestamps — format: "2026-03-07 00:28:48 -0800"
+            for ts_key, col in [('inBedStart', 'sleep_start'), ('inBedEnd', 'sleep_end')]:
+                raw = s.get(ts_key)
+                if raw:
+                    try:
+                        from datetime import datetime as dt
+                        # Python 3.7+ strptime with UTC offset
+                        parsed = dt.strptime(raw, "%Y-%m-%d %H:%M:%S %z")
+                        result[col] = parsed.isoformat()
+                    except Exception:
+                        result[col] = raw  # store raw if parse fails
 
+        elif name == 'heart_rate':
+            avgs = [d['Avg'] for d in data if 'Avg' in d]
+            maxs = [d['Max'] for d in data if 'Max' in d]
+            mins = [d['Min'] for d in data if 'Min' in d]
+            if avgs:
+                result['heart_rate_avg'] = round(sum(avgs) / len(avgs), 2)
+            if maxs:
+                result['heart_rate_max'] = max(maxs)
+            if mins:
+                result['heart_rate_min'] = min(mins)
 
-def _extract_metric_sum(metrics_by_name: dict, name: str):
-    """Sum all qty values for a named metric."""
-    m = metrics_by_name.get(name)
-    if not m:
-        return None
-    pts = [p.get("qty") for p in m.get("data", []) if p.get("qty") is not None]
-    return round(sum(pts), 2) if pts else None
+        elif name == 'resting_heart_rate':
+            result['heart_rate_resting'] = data[-1].get('qty')
 
+        elif name == 'heart_rate_variability':
+            vals = [d['qty'] for d in data if 'qty' in d]
+            if vals:
+                result['hrv_ms'] = round(sum(vals) / len(vals), 2)
 
-def _extract_sleep_hours(metrics_by_name: dict):
-    """Sum 'asleep' values from sleep_analysis metric."""
-    m = metrics_by_name.get("sleep_analysis")
-    if not m:
-        return None
-    total = sum(
-        p.get("qty", 0) or 0
-        for p in m.get("data", [])
-        if str(p.get("value", "")).lower() in ("asleep", "inbed", "")
-        or p.get("qty") is not None
-    )
-    # If data points have a 'value' field filter to 'asleep' category
-    asleep_pts = [p for p in m.get("data", []) if str(p.get("value", "")).lower() == "asleep"]
-    if asleep_pts:
-        total = sum(p.get("qty", 0) or 0 for p in asleep_pts)
-    elif m.get("data"):
-        total = sum(p.get("qty", 0) or 0 for p in m.get("data", []) if p.get("qty") is not None)
-    else:
-        return None
-    return round(total, 2) if total else None
+        elif name == 'step_count':
+            result['steps'] = int(sum(d.get('qty', 0) for d in data))
+
+        elif name == 'active_energy':
+            result['active_calories'] = round(sum(d.get('qty', 0) for d in data), 2)
+
+        elif name == 'walking_running_distance':
+            result['distance_miles'] = round(sum(d.get('qty', 0) for d in data), 4)
+
+        elif name == 'basal_energy_burned':
+            result['basal_calories'] = round(sum(d.get('qty', 0) for d in data), 2)
+
+        elif name == 'respiratory_rate':
+            vals = [d['qty'] for d in data if 'qty' in d]
+            if vals:
+                result['respiratory_rate'] = round(sum(vals) / len(vals), 2)
+
+        elif name == 'flights_climbed':
+            result['flights_climbed'] = round(sum(d.get('qty', 0) for d in data), 1)
+
+        elif name == 'apple_stand_hour':
+            result['stand_hours'] = round(sum(d.get('qty', 0) for d in data), 1)
+
+        elif name == 'apple_stand_time':
+            result['stand_time_minutes'] = round(sum(d.get('qty', 0) for d in data), 1)
+
+        elif name == 'apple_exercise_time':
+            result['exercise_minutes'] = round(sum(d.get('qty', 0) for d in data), 1)
+
+        elif name == 'walking_heart_rate_average':
+            vals = [d['qty'] for d in data if 'qty' in d]
+            if vals:
+                result['walking_heart_rate_avg'] = round(sum(vals) / len(vals), 2)
+
+        elif name == 'walking_speed':
+            vals = [d['qty'] for d in data if 'qty' in d]
+            if vals:
+                result['walking_speed_mph'] = round(sum(vals) / len(vals), 4)
+
+        elif name == 'walking_step_length':
+            vals = [d['qty'] for d in data if 'qty' in d]
+            if vals:
+                result['walking_step_length_in'] = round(sum(vals) / len(vals), 4)
+
+        elif name == 'walking_asymmetry_percentage':
+            vals = [d['qty'] for d in data if 'qty' in d]
+            if vals:
+                result['walking_asymmetry_pct'] = round(sum(vals) / len(vals), 4)
+
+        elif name == 'walking_double_support_percentage':
+            vals = [d['qty'] for d in data if 'qty' in d]
+            if vals:
+                result['walking_double_support_pct'] = round(sum(vals) / len(vals), 4)
+
+        elif name == 'environmental_audio_exposure':
+            vals = [d['qty'] for d in data if 'qty' in d]
+            if vals:
+                result['env_audio_exposure_db'] = round(sum(vals) / len(vals), 2)
+
+        elif name == 'headphone_audio_exposure':
+            vals = [d['qty'] for d in data if 'qty' in d]
+            if vals:
+                result['headphone_audio_db'] = round(sum(vals) / len(vals), 2)
+
+        elif name == 'physical_effort':
+            vals = [d['qty'] for d in data if 'qty' in d]
+            if vals:
+                result['physical_effort'] = round(sum(vals) / len(vals), 4)
+
+        elif name == 'stair_speed_up':
+            vals = [d['qty'] for d in data if 'qty' in d]
+            if vals:
+                result['stair_speed_up'] = round(sum(vals) / len(vals), 4)
+
+        elif name == 'stair_speed_down':
+            vals = [d['qty'] for d in data if 'qty' in d]
+            if vals:
+                result['stair_speed_down'] = round(sum(vals) / len(vals), 4)
+
+    return result
 
 
 @app.post("/health-data")
 async def health_data(request: Request):
     """
     Receives Apple Health data from Health Auto Export app.
-    Parses metrics and stores persistently in Supabase apple_health_log table.
+    Parses all 23 metric types and stores in Supabase apple_health_log table.
     Local sync: run ~/clawd/health/sync-health-csv.py to pull to CSV.
     """
     try:
@@ -456,33 +541,15 @@ async def health_data(request: Request):
     # Extract metrics list (Health Auto Export format)
     metrics = payload.get("data", {}).get("metrics", []) or payload.get("metrics", [])
 
-    # Build lookup dict by metric name
-    metrics_by_name = {m.get("name", ""): m for m in metrics if m.get("name")}
+    # Parse all metrics into flat dict
+    parsed = parse_metrics(metrics)
 
-    # Extract each metric
-    heart_rate_avg = _extract_metric_avg(metrics_by_name, "heart_rate")
-    heart_rate_resting = _extract_metric_latest(metrics_by_name, "resting_heart_rate")
-    hrv_ms = _extract_metric_latest(metrics_by_name, "heart_rate_variability")
-    steps_raw = _extract_metric_sum(metrics_by_name, "step_count")
-    steps = int(steps_raw) if steps_raw is not None else None
-    active_calories = _extract_metric_sum(metrics_by_name, "active_energy_burned")
-    sleep_hours = _extract_sleep_hours(metrics_by_name)
-    respiratory_rate = _extract_metric_avg(metrics_by_name, "respiratory_rate")
-    blood_oxygen_pct = _extract_metric_avg(metrics_by_name, "oxygen_saturation")
-
-    # Insert into Supabase
+    # Build insert row
     insert_data = {
         "source": "apple_health_auto_export",
-        "heart_rate_avg": heart_rate_avg,
-        "heart_rate_resting": heart_rate_resting,
-        "hrv_ms": hrv_ms,
-        "steps": steps,
-        "active_calories": active_calories,
-        "sleep_hours": sleep_hours,
-        "respiratory_rate": respiratory_rate,
-        "blood_oxygen_pct": blood_oxygen_pct,
         "raw_metrics_count": len(metrics),
         "raw_payload": payload,
+        **parsed,
     }
     # Remove None values so Supabase uses column defaults
     insert_data = {k: v for k, v in insert_data.items() if v is not None}
@@ -513,6 +580,7 @@ async def health_data(request: Request):
         "status": "ok",
         "stored": stored,
         "metrics_received": len(metrics),
+        "parsed_fields": list(parsed.keys()),
         "received_at": timestamp,
         **({"error": store_error} if store_error else {}),
     })
